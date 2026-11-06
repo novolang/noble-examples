@@ -1,0 +1,107 @@
+// pc/hci_console.nv — the console lines of an HCI exchange on a PC.
+//
+// `>` is an HCI Command packet the Host sent and `<` an HCI packet the
+// Controller sent, each with its HCI packet indicator first ([Vol 4]
+// Part A, Section 2), followed by a line that names it.  A PC program
+// prints the exchange this way; main_pc.nv does.  The formatting is the code
+// of `noble/src/advertiser.nv`; this module adds only the printing, which a
+// device image has no console for.
+
+use hci_commands
+use hci_frame
+use advertiser
+use hci_codec
+use hci_socket
+
+@tier(app)
+fn print_packet(pkt: [u8]) [io]
+    println("< " + advertiser.hex_bytes(pkt))
+    println("  " + advertiser.describe_packet(pkt))
+
+// Write HCI packets the Host sends without waiting for an answer, HCI
+// ACL Data packets, and print each.  `false` when the bridge did not
+// take one; the rest are not sent.
+@tier(app)
+fn send_and_print(var link: HciSocket, pkts: [[u8]]) -> Bool [io, net, mutate]
+    for pkt in pkts
+        println("> " + advertiser.hex_bytes(pkt))
+        println("  " + advertiser.describe_packet(pkt))
+        if not link.send_packet(pkt)
+            eprintln("error: the bridge did not take an HCI ACL Data packet")
+            return false
+    true
+
+// Run one command and print the exchange.  `false` after printing why
+// the command failed.
+@tier(app)
+fn run_and_print(var link: HciSocket, c: HciCmdMsg) -> Bool [io, net, mutate]
+    match run_for_return_parameters(var link, c)
+        None    => false
+        Some(_) => true
+
+// Run one command and print the exchange.  The return parameters that
+// follow Status in its Command Complete event, empty for a Command
+// Status event, or None after printing why the command failed.
+@tier(app)
+fn run_for_return_parameters(var link: HciSocket, c: HciCmdMsg) -> ?[u8] [io, net, mutate]
+    match run_collecting(var link, c).return_parameters
+        None     => None
+        Some(rp) => Some(rp[:])
+
+// One command's outcome as `run_for_return_parameters` gives it, its
+// Status (advertiser.STATUS_NOT_SENT or STATUS_NO_ANSWER when there was
+// none), and the packets the Controller sent before the answer, which
+// answer no command of the Host's, HCI packet indicator first, in the
+// order received.
+struct CommandRun
+    return_parameters: ?[u8]
+    status: Int
+    passed_over: [[u8]]
+
+// Run one command and print the exchange, keeping the packets that came
+// before its answer for the caller.
+@tier(app)
+fn run_collecting(var link: HciSocket, c: HciCmdMsg) -> CommandRun [io, net, mutate]
+    let out = advertiser.run_command(var link, c, advertiser.COMMAND_TIMEOUT_MS)
+    println("> " + advertiser.hex_bytes(out.sent))
+    for pkt in out.passed_over
+        print_packet(pkt)
+    CommandRun { return_parameters: answer_of(c, out),
+        status: out.status,
+        passed_over: out.passed_over }
+
+// The return parameters of a run command, or None after printing why it
+// failed.
+@tier(app)
+fn answer_of(c: HciCmdMsg, out: CommandOutcome) -> ?[u8] [io]
+    let name = advertiser.command_name(c.opcode)
+    if out.status == advertiser.STATUS_NOT_SENT
+        eprintln("error: " + name + ": the bridge did not take the command")
+        return None
+    if out.status == advertiser.STATUS_NO_ANSWER
+        eprintln("error: " + name + ": no Command Complete or Command Status within " + string_of_int(advertiser.COMMAND_TIMEOUT_MS) + " ms")
+        return None
+    println("< " + advertiser.hex_bytes(out.answer))
+    println("  " + name + ": status " + advertiser.hex8(out.status))
+    if out.status != 0
+        eprintln("error: " + name + " failed with status " + advertiser.hex8(out.status))
+        return None
+    if c.opcode == hci_commands.opcode_read_local_version_information()
+        println("  " + advertiser.describe_local_version(out.answer))
+    // The answer is the HCI packet indicator, then the event: Event_Code,
+    // Parameter_Total_Length, Num_HCI_Command_Packets, Command_Opcode
+    // (2), Status, the other return parameters ([Vol 4] Part E, Section
+    // 7.7.14).
+    if hci_codec.is_command_complete(out.answer[1:]) and list.len(out.answer) > 7
+        Some(out.answer[7:])
+    else
+        Some([])
+
+// Run the commands in order and print each exchange.  `false` at the
+// first that fails; the rest are not sent.
+@tier(app)
+fn run_all_and_print(var link: HciSocket, cmds: [HciCmdMsg]) -> Bool [io, net, mutate]
+    for c in cmds
+        if not run_and_print(var link, c)
+            return false
+    true

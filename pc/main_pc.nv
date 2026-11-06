@@ -1,0 +1,177 @@
+/* pc/main_pc.nv — a BLE Host on a PC, advertising through a Controller on
+ * the HCI UART Transport Layer.
+ *
+ * Connects to the UNIX-socket bridge in front of the Controller's serial
+ * port (README.md, "The Host on a PC"), runs the bring-up of
+ * `noble/src/advertiser.nv` over it, prints every packet the Controller
+ * sends until SIGINT or SIGTERM, and disables advertising before it exits.
+ * Exit status 1 is a failed command or a missing bridge, 2 an argument the
+ * program cannot use.
+ *
+ * Everything here is the PC's part: the command line, the console
+ * (`hci_console.nv`) and the socket (`hci_socket.nv`).  The Host logic is
+ * the code of the package noble.  The program is in pc/ rather than src/
+ * because a module under src/ joins every device build of the package, and
+ * this `main` would make std.net reachable from the Controller image.
+ *
+ * Build and run from the directory of the package, with the bridge running:
+ *   novo pkg build --bin main_pc --target=host -o main_pc
+ *   ./main_pc --socket /tmp/novo_hci.sock --name NovoPcHost \
+ *       --address C0:4E:4F:56:4F:01 --interval 100
+ */
+use std.bytes
+use std.env
+use std.process
+use hci_transport
+use advertiser
+use hci_socket
+use hci_console
+
+// How long one wait for a packet lasts while advertising; the program
+// checks for SIGINT and SIGTERM between waits.
+const EVENT_WAIT_MS = 500
+
+// ── Arguments ───────────────────────────────────────────────────────
+//
+// The command line is read by hand rather than with std.cli: in a
+// package whose manifest tier is embedded, `novo build --target=host`
+// stops at `Cli.new(...).parse_env_or_exit()` with internal compiler
+// error E6000 ("cannot resolve this call's return type").
+
+const USAGE = "usage: main_pc [--socket PATH] [--name NAME] [--address ADDR] [--interval MS]\n  -s, --socket    the bridge's UNIX socket (default /tmp/novo_hci.sock)\n  -n, --name      the Complete Local Name to advertise (default NovoPcHost)\n  -a, --address   static random address, most significant octet first (default C0:4E:4F:56:4F:01)\n  -i, --interval  advertising interval in milliseconds, 20 to 10240 (default 100)"
+
+struct PcArgs
+    socket: Str
+    name: Str
+    address: Str
+    interval_ms: Int
+    help: Bool
+
+// The long name of a flag spelled `token`, or "" when `token` is not
+// one of this program's flags.
+@tier(app)
+fn flag_name(token: Str) -> Str
+    match token
+        "-s"         => "socket"
+        "--socket"   => "socket"
+        "-n"         => "name"
+        "--name"     => "name"
+        "-a"         => "address"
+        "--address"  => "address"
+        "-i"         => "interval"
+        "--interval" => "interval"
+        _            => ""
+
+// The arguments after the program name.  A flag takes its value from
+// the next argument or after `=`: `--name X` and `--name=X` are the
+// same.
+@tier(app)
+fn parse_args(argv: [Str]) -> Result<PcArgs, Str>
+    var socket = "/tmp/novo_hci.sock"
+    var name = "NovoPcHost"
+    var address = "C0:4E:4F:56:4F:01"
+    var interval = "100"
+    var help = false
+    var error = ""
+    var i = 0
+    while i < list.len(argv) and error == ""
+        let token = argv[i]
+        let eq = str.index(token, "=") ?? -1
+        let flag = if eq > 0
+            str.slice(token, 0, eq)
+        else
+            token
+        i = i + 1
+        if token == "-h" or token == "--help"
+            help = true
+        else if flag_name(flag) == ""
+            error = "unknown argument " + token
+        else if eq < 0 and i >= list.len(argv)
+            error = flag + " needs a value"
+        else
+            var value = ""
+            if eq > 0
+                value = str.slice(token, eq + 1, str.len(token))
+            else
+                value = argv[i]
+                i = i + 1
+            match flag_name(flag)
+                "socket"  =>
+                    socket = value
+                "name"    =>
+                    name = value
+                "address" =>
+                    address = value
+                _         =>
+                    interval = value
+    if error != ""
+        Err(error)
+    else
+        match str.to_int(interval)
+            None     => Err("--interval " + interval + " is not a number")
+            Some(ms) => Ok(PcArgs { socket: socket, name: name, address: address, interval_ms: ms, help: help })
+
+@tier(app)
+fn text_bytes(s: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(s))
+
+// The Advertiser the arguments describe, or the reason they cannot be
+// used.
+@tier(app)
+fn advertiser_for(args: PcArgs) -> Result<Advertiser, Str>
+    match advertiser.parse_address(text_bytes(args.address))
+        None       => Err("--address " + args.address + " is not six colon-separated octets")
+        Some(addr) =>
+            match advertiser.make_advertiser(text_bytes(args.name), addr, args.interval_ms)
+                Ok(adv) => Ok(adv)
+                Err(e)  => Err(e)
+
+// Print every packet the Controller sends until SIGINT or SIGTERM, or
+// until the bridge closes.
+@tier(app)
+fn print_events(var link: HciSocket) [io, net, mutate]
+    while not process.shutdown_requested() and link.open
+        match link.recv_packet(EVENT_WAIT_MS)
+            None      =>
+                pass
+            Some(pkt) =>
+                hci_console.print_packet(pkt)
+    if not link.open
+        eprintln("the bridge closed the connection")
+
+@tier(app)
+fn main() [io, net, mutate]
+    // The first call installs the SIGINT and SIGTERM handler.
+    let _ = process.shutdown_requested()
+    match parse_args(env.user_args())
+        Err(reason) =>
+            eprintln("error: " + reason)
+            eprintln(USAGE)
+            process.exit(2)
+        Ok(args)    =>
+            if args.help
+                println(USAGE)
+            else
+                run(args)
+
+@tier(app)
+fn run(args: PcArgs) [io, net, mutate]
+    match advertiser_for(args)
+        Err(reason) =>
+            eprintln("error: " + reason)
+            process.exit(2)
+        Ok(adv)     =>
+            match hci_socket.hci_socket_connect(args.socket)
+                None    =>
+                    eprintln("error: nothing listens on " + args.socket + "; start the socat bridge first")
+                    process.exit(1)
+                Some(s) =>
+                    var link = s
+                    if not hci_console.run_all_and_print(var link, advertiser.bringup_commands(adv))
+                        hci_socket.close_socket(var link)
+                        process.exit(1)
+                    println("advertising as " + args.name + " from " + advertiser.format_address(adv.address) + " every " + string_of_int(adv.interval_ms) + " ms; Ctrl-C stops")
+                    print_events(var link)
+                    if link.open
+                        let _ = hci_console.run_and_print(var link, advertiser.stop_command())
+                    hci_socket.close_socket(var link)

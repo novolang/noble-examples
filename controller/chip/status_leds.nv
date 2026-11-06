@@ -1,0 +1,116 @@
+// controller/chip/status_leds.nv — the DK's four LEDs show what the Controller does.
+//
+// A Host on a PC drives the Controller (`hci_uart_main.nv`), so the board itself has no screen.  The LEDs are
+// read from the Controller's own state, which the Host cannot hide or misreport, once in each turn of the main loop:
+//
+//   LED1  blinks once a second while the Controller advertises (a broadcast's extended advertising too), four times a second while a connection is up and
+//         not encrypted, and stays on while it is encrypted
+//   LED2  on while a Connected Isochronous Stream is established or a Broadcast Isochronous Group is up
+//   LED3  toggles with every tenth packet a stream received or a broadcast sent, five times a second at 10 ms per SDU
+//   LED4  the volume the Host reports, as a brightness: the Host writes the vendor-specific HCI command 0xFC10
+//         (Volume, Mute) and the LED shines at Volume of 255 of its brightness, or not at all when Mute is 1.
+//         `led_snoop.snoop` reads the command from the stream of octets the Controller is given; the Controller
+//         itself answers the command with Unknown HCI Command, which the Host ignores.
+//
+// The LEDs of the DK are active high (board README).  The pins are the board's `led1` to `led4`.
+//
+// The pins are written when a level changes, so a turn of the loop that changes nothing writes nothing.
+
+use ctl_limits
+use ctl_hci
+use ll_iso
+use ll_big
+use chip.led_snoop
+
+// Packets of a stream per toggle of LED3.
+const PACKETS_PER_TOGGLE = 10
+
+// Half a period of the advertising blink, in microseconds.
+const BLINK_HALF_US = 500000
+
+// The level written to each LED last, so that a pin is written when it changes.
+var led_level1 = -1
+var led_level2 = -1
+var led_level3 = -1
+var led_level4 = -1
+
+// The microseconds of one period of the brightness of LED4.
+const PWM_PERIOD_US = 2000
+
+// The packets all streams had received at the last toggle of LED3, and the level LED3 has.
+var led_seen_packets = 0
+var led_toggle3      = 0
+
+// Set the four pins to outputs, off.
+@no_alloc
+fn init() [hw, mutate]
+    led_snoop.init()
+    hal.gpio.mode(bsp.board.led1(), 1)
+    hal.gpio.mode(bsp.board.led2(), 1)
+    hal.gpio.mode(bsp.board.led3(), 1)
+    hal.gpio.mode(bsp.board.led4(), 1)
+    write1(0)
+    write2(0)
+    write3(0)
+    write4(0)
+
+@no_alloc
+fn write1(v: Int) [hw, mutate]
+    if v != led_level1
+        led_level1 = v
+        hal.gpio.set(bsp.board.led1(), v)
+
+@no_alloc
+fn write2(v: Int) [hw, mutate]
+    if v != led_level2
+        led_level2 = v
+        hal.gpio.set(bsp.board.led2(), v)
+
+@no_alloc
+fn write3(v: Int) [hw, mutate]
+    if v != led_level3
+        led_level3 = v
+        hal.gpio.set(bsp.board.led3(), v)
+
+@no_alloc
+fn write4(v: Int) [hw, mutate]
+    if v != led_level4
+        led_level4 = v
+        hal.gpio.set(bsp.board.led4(), v)
+
+// Show the state of the Controller `c` at the time `now_us`, in microseconds.
+@satisfies("REQ-BLE-DEMO-002")
+@no_alloc
+fn update(var c: Controller, now_us: Int) [hw, mutate]
+    let connected = c.links[0].live
+    if connected and (c.links[0].enc_tx or c.links[0].enc_rx)
+        write1(1)
+    else if connected
+        write1(now_us / (BLINK_HALF_US / 4) % 2)
+    else if ctl_hci.adv_active(var c)
+        write1(now_us / BLINK_HALF_US % 2)
+    else
+        write1(0)
+    write4((if now_us % PWM_PERIOD_US * 255 < led_snoop.brightness() * PWM_PERIOD_US then 1 else 0))
+    var up = false
+    var packets = 0
+    for k in 0..ctl_limits.cis_slots()
+        if c.cis[k].state == ll_iso.S_UP
+            up = true
+        packets = packets + c.cis[k].rx_num
+    // A Broadcast Isochronous Group the Controller sends: LED2 is on while it is up, and its packets toggle LED3 like a stream's.
+    // A build without broadcast groups fills neither table (a Vec has no zero capacity), so it reads none of them.
+    if ctl_limits.big_on()
+        for g in 0..ctl_limits.big_slots()
+            if c.bigs[g].state == ll_big.B_UP
+                up = true
+        for k in 0..ctl_limits.bis_slots()
+            packets = packets + c.bis[k].tx_num
+    write2((if up then 1 else 0))
+    // A stream that ends and starts again counts from zero.
+    if packets < led_seen_packets
+        led_seen_packets = packets
+    if packets - led_seen_packets >= PACKETS_PER_TOGGLE
+        led_seen_packets = packets
+        led_toggle3 = 1 - led_toggle3
+    write3((if up then led_toggle3 else 0))

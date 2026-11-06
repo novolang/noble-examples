@@ -1,0 +1,3 @@
+# The Controller with its isochronous channels: four Connected Isochronous Streams in one group and two Broadcast Isochronous
+# Groups of four streams, with the features an LE Audio Host asks for.  The profile `ctl_iso` of the package noble-controller.
+extends = "noble-controller:ctl_iso"

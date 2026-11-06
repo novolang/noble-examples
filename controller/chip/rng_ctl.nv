@@ -1,0 +1,31 @@
+// controller/chip/rng_ctl.nv — hand the random octets of the nRF54L's generator to the
+// Controller's LE Rand command.
+//
+// The generator (`rng_nrf54.nv`, in the Nordic board package) knows the FIFO
+// and nothing of the Controller.  `fill` waits, with a bound, for two words and
+// hands them to the Controller as the 8 octets of the LE Rand answer.
+
+use ctl_hci
+use rng_nrf54
+
+// Take two words of the FIFO as 8 octets, least significant octet of the
+// first word first.  False when the generator did not produce them within
+// the bound.
+@no_alloc
+fn take(var c: Controller) -> Bool [hw, mutate]
+    if not rng_nrf54.wait_words(2)
+        return false
+    for w in 0..2
+        let word = rng_nrf54.fifo_word()
+        for k in 0..4
+            ctl_hci.ctl_async_put(var c, 4 * w + k, (word >>> (8 * k)) & 0xFF)
+    true
+
+// Finish the LE Rand command in progress with 8 random octets, or with a
+// hardware failure.
+@no_alloc
+fn fill(var c: Controller) [hw, mutate]
+    if take(var c)
+        ctl_hci.ctl_async_complete(var c)
+    else
+        ctl_hci.ctl_async_fail(var c)

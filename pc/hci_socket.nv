@@ -1,0 +1,142 @@
+// pc/hci_socket.nv — `HciSocket`: the HCI UART Transport Layer carried
+// by a stream socket.
+//
+// The Host side of H4, which the specification calls the HCI UART
+// Transport Layer: each HCI packet follows its HCI packet indicator
+// ([Vol 4] Part A, Section 2).  Here it is carried by a UNIX-domain
+// stream socket instead of a UART.  A bridge such as
+// `socat UNIX-LISTEN:<path>,fork <serial-port>,raw,b1000000,crtscts`
+// holds the serial port and relays bytes both ways, so the byte
+// stream on the socket is the byte stream on the wire.
+//
+// The socket delivers bytes in whatever pieces the kernel hands
+// over, and one piece can end in the middle of a packet or hold
+// several.  The struct keeps the bytes that do not yet make a
+// complete packet in `rx`, and `hci_deframer.next_packet` cuts
+// complete packets off its front.
+//
+// This is the only module that touches the wire on a PC, and the
+// only one besides the entry point that uses std.net.  It implements
+// `HciLink`, which the shared Host code drives, and `HciTransport` on
+// top of it.  It lives in pc/ because every module under src/ joins
+// every device build, an impl's methods join the device image with
+// it, and the device runtime has no std.net.
+
+use std.net
+use std.bytes
+use hci_frame
+use hci_transport
+use hci_h4
+use hci_deframer
+
+// Largest read taken from the socket in one call.  It holds the
+// largest event, 3 + 255 bytes; a longer HCI ACL Data packet arrives
+// over several reads.
+const HCI_SOCKET_READ_SIZE = 512
+
+struct HciSocket
+    sock: Sock
+    var rx: [u8]
+    var open: Bool
+
+// Connect to the bridge listening on `path`.  `None` when nothing
+// listens there.
+@tier(app)
+fn hci_socket_connect(path: Str) -> ?HciSocket [net]
+    match net.unix_connect(path)
+        None       => None
+        Some(sock) => Some(HciSocket { sock: sock, rx: [], open: true })
+
+// The packet as the list of byte values `bytes.from_byte_list` takes.
+@tier(app)
+fn to_int_list(pkt: [u8]) -> [Int]
+    var out: [Int] = []
+    for b in pkt
+        list.push(out, b as Int)
+    out
+
+// Wait up to `timeout_ms` for bytes and append what arrives to `rx`.
+// `false` when none arrived in time or the bridge closed.
+@tier(app)
+fn fill(var s: HciSocket, timeout_ms: Int) -> Bool [net, mutate]
+    if not net.fd_wait_readable(s.sock, timeout_ms)
+        false
+    else
+        match net.recv_bytes(s.sock, HCI_SOCKET_READ_SIZE)
+            None        =>
+                // Readable with nothing to read is the peer closing.
+                s.open = false
+                false
+            Some(chunk) =>
+                if bytes.len(chunk) == 0
+                    s.open = false
+                    false
+                else
+                    list.append(s.rx, bytes.to_byte_list(chunk))
+                    true
+
+@tier(app)
+fn close_socket(var s: HciSocket) [net, mutate]
+    if s.open
+        net.close(s.sock)
+        s.open = false
+
+impl HciLink[net, mutate] for HciSocket
+    // Write one HCI packet, HCI packet indicator first.  `true` only when
+    // every byte went out.
+    @tier(app)
+    fn send_packet(self, pkt: [u8]) -> Bool [net]
+        net.send_bytes(self.sock, bytes.from_byte_list(to_int_list(pkt)))
+
+    // The next complete HCI packet, HCI packet indicator first, or `None` when
+    // none completes within `timeout_ms` of the last byte received.
+    @tier(app)
+    fn recv_packet(var self, timeout_ms: Int) -> ?[u8] [net, mutate]
+        let r = hci_deframer.next_packet(self.rx)
+        // The deframer's result fields are read-only, and `rx` is
+        // written by the next `fill`, so it takes a copy.
+        self.rx = r.new_buf[:]
+        match r.packet
+            Some(pkt) => Some(pkt[:])
+            None      =>
+                if fill(var self, timeout_ms)
+                    self.recv_packet(timeout_ms)
+                else
+                    None
+
+impl HciTransport for HciSocket
+    type CmdFrame = HciCmdMsg
+    type EvtFrame = HciEvtMsg
+
+    @tier(app)
+    fn send_command(self, cmd: HciCmdMsg) -> Bool [net]
+        self.send_packet(hci_h4.frame_h4(hci_h4.PKT_COMMAND, hci_frame.encode_hci_cmd_msg(cmd)))
+
+    // A poll, as the trait defines it: an event already received, or
+    // `None` at once.  Other packet types are dropped.
+    @tier(app)
+    fn recv_event(var self) -> ?HciEvtMsg [net, mutate]
+        match self.recv_packet(0)
+            None      => None
+            Some(pkt) =>
+                if (pkt[0] as Int) == hci_h4.PKT_EVENT
+                    Some(hci_frame.decode_hci_evt_msg(pkt[1:]))
+                else
+                    None
+
+    @tier(app)
+    fn send_acl(self, acl: [u8]) -> Bool [net]
+        self.send_packet(hci_h4.frame_h4(hci_h4.PKT_ACL, acl))
+
+    // HCI ACL Data packets reach the Host through `recv_packet`.
+    @tier(app)
+    fn recv_acl(self) -> ?[u8]
+        None
+
+    @tier(app)
+    fn is_open(self) -> Bool
+        self.open
+
+    @tier(app)
+    fn close(var self) [net, mutate]
+        close_socket(var self)

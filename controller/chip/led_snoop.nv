@@ -1,0 +1,153 @@
+// controller/chip/led_snoop.nv — the vendor-specific HCI command that sets the brightness of LED4, read from the stream of
+// octets the Host sends the Controller.
+//
+// A Host with a Volume Control Service (an LE Audio earbud) writes the command 0xFC10 with two parameters, Volume (0 to 255) and
+// Mute (0 or 1), whenever the volume or the mute of its Volume Control Service changes.  The Controller does not know
+// the command and answers it with Unknown HCI Command; the main loop of the image gives each octet to `snoop` before
+// the Controller, which follows the packets of the stream by their headers (a Command has the opcode and a one-octet
+// length, an ACL Data packet and an ISO Data packet the handle and a length of two octets) and keeps the brightness
+// of the last command.  Mute 1 is no brightness.  `status_leds.nv` shows it.
+//
+// The tests are at the end of the file.
+
+use std.test
+
+// The vendor-specific command that sets the brightness, and where `snoop` is in the stream: `seen` octets of the
+// packet counted, the `kind` of the packet (the HCI packet indicator, 0 between packets), the octets of the packet's
+// header read, and its length.
+const VENDOR_OPCODE = 0xFC10
+var snoop_seen               = 0
+var snoop_kind               = 0
+var snoop_header: Vec[u8; 6] = Vec.new()
+var snoop_length             = 0
+var snoop_params: Vec[u8; 2] = Vec.new()
+
+// The brightness of LED4, 0 to 255.
+var snoop_level = 0
+
+// The octets of the header of a packet of type `k` (the indicator not counted), and where its length is: a Command
+// has the opcode (2) and the length (1), an ACL Data packet the handle (2) and the length (2), an ISO Data packet
+// the same.  A type this does not know leaves the stream as it is.
+@no_alloc
+fn header_octets(k: Int) -> Int
+    if k == 1
+        3
+    else if k == 2 or k == 5
+        4
+    else
+        0
+
+// Look at one octet of the stream the Host sends the Controller, on its way to the Controller: the vendor-specific
+// command of LED4 is read from it.  Every other packet is counted through and left alone.
+@no_alloc
+fn snoop(b: Int) [mutate]
+    if snoop_kind == 0
+        if header_octets(b) > 0
+            snoop_kind = b
+            snoop_seen = 0
+            snoop_length = 0
+        return
+    if snoop_seen < header_octets(snoop_kind)
+        snoop_header[snoop_seen] = b as u8
+        snoop_seen = snoop_seen + 1
+        if snoop_seen == header_octets(snoop_kind)
+            if snoop_kind == 1
+                snoop_length = snoop_header[2] as Int
+            else if snoop_kind == 5
+                snoop_length = snoop_header[2] as Int | ((b & 0x3F) << 8)
+            else
+                snoop_length = snoop_header[2] as Int | (b << 8)
+            if snoop_length == 0
+                snoop_kind = 0
+        return
+    let at = snoop_seen - header_octets(snoop_kind)
+    if snoop_kind == 1 and at < 2 and (snoop_header[0] as Int) == (VENDOR_OPCODE & 0xFF) and (snoop_header[1] as Int) == (VENDOR_OPCODE >>> 8) and snoop_length == 2
+        snoop_params[at] = b as u8
+    snoop_seen = snoop_seen + 1
+    if snoop_seen - header_octets(snoop_kind) == snoop_length
+        if snoop_kind == 1 and (snoop_header[0] as Int) == (VENDOR_OPCODE & 0xFF) and (snoop_header[1] as Int) == (VENDOR_OPCODE >>> 8) and snoop_length == 2
+            snoop_level = if (snoop_params[1] as Int) != 0
+                0
+            else
+                snoop_params[0] as Int
+        snoop_kind = 0
+
+// Size the two buffers.
+@no_alloc
+fn init() [mutate]
+    snoop_kind = 0
+    snoop_seen = 0
+    snoop_level = 0
+    for _ in 0..6
+        let _h = snoop_header.push(0)
+    for _ in 0..2
+        let _v = snoop_params.push(0)
+
+@no_alloc
+fn brightness() -> Int [mutate]
+    snoop_level
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+@tier(app)
+fn feed(bytes: [u8]) [mutate]
+    for b in bytes
+        snoop(b as Int)
+
+@tier(app)
+fn vendor(volume: Int, mute: Int) -> [u8]
+    [0x01 as u8, 0x10 as u8, 0xFC as u8, 0x02 as u8, volume as u8, mute as u8]
+
+@test
+@satisfies("REQ-BLE-DEMO-003")
+fn test_the_vendor_command_sets_the_brightness_and_mute_clears_it()
+    init()
+    feed(vendor(116, 0))
+    test.assert_eq(brightness(), 116)
+    feed(vendor(116, 1))
+    test.assert_eq(brightness(), 0)
+    feed(vendor(255, 0))
+    test.assert_eq(brightness(), 255)
+
+@test
+@satisfies("REQ-BLE-DEMO-003")
+fn test_other_packets_are_followed_through_and_leave_the_brightness_alone()
+    init()
+    feed(vendor(80, 0))
+    // HCI_Reset, an ACL Data packet of 3 octets, an ISO Data packet of 2 octets, and a command of another opcode with
+    // the parameters of a vendor command.
+    feed([0x01, 0x03, 0x0C, 0x00])
+    feed([0x02, 0x40, 0x00, 0x03, 0x00, 0x10, 0x20, 0x30])
+    feed([0x05, 0x40, 0x00, 0x02, 0x00, 0xFF, 0xFF])
+    feed([0x01, 0x11, 0xFC, 0x02, 0x09, 0x00])
+    test.assert_eq(brightness(), 80)
+    // The stream is still in step: the vendor command that follows is read.
+    feed(vendor(7, 0))
+    test.assert_eq(brightness(), 7)
+
+@test
+@satisfies("REQ-BLE-DEMO-003")
+fn test_an_iso_data_packet_length_ignores_the_two_flag_bits()
+    init()
+    // The length field of an ISO Data packet is 14 bits; the two above it are not part of the length.
+    feed([0x05, 0x40, 0x00, 0x02, 0xC0, 0x01, 0x02])
+    feed(vendor(33, 0))
+    test.assert_eq(brightness(), 33)
+
+@test
+@satisfies("REQ-BLE-DEMO-003")
+fn test_a_vendor_command_of_the_wrong_length_is_not_read()
+    init()
+    feed(vendor(50, 0))
+    feed([0x01, 0x10, 0xFC, 0x01, 0x99])
+    test.assert_eq(brightness(), 50)
+    feed([0x01, 0x10, 0xFC, 0x03, 0x99, 0x00, 0x00])
+    test.assert_eq(brightness(), 50)
+
+@test
+@satisfies("REQ-BLE-DEMO-003")
+fn test_a_byte_that_starts_no_packet_is_skipped()
+    init()
+    feed([0x7F, 0x00])
+    feed(vendor(21, 0))
+    test.assert_eq(brightness(), 21)

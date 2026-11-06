@@ -1,0 +1,49 @@
+[package]
+name        = "noble-examples"
+version     = "0.1.0"
+description = "Programs built on the packages of the noble Bluetooth Low Energy stack: the noble Controller on an nRF54LM20 DK that a Host drives over the DK's serial port (hci_uart), and a Host on a PC that brings the Controller up and advertises through it (main_pc)."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "app"
+tags        = ["bluetooth", "ble", "examples", "controller", "hci", "nrf54", "embedded"]
+repository  = "https://github.com/novolang/noble-examples"
+maintainers = ["novo-lang"]
+novo        = ">= 0.23.1"
+
+# The entry of `novo pkg build`: the Host on a PC.  The Controller image is a [[bin]] of its own, built for the board.
+main = "pc/main_pc.nv"
+
+# The embedded tier of the board the Controller image runs on.  The programs under pc/ are built for the host, which the tier
+# does not restrict; the modules of the noble packages they reach were written for the embedded tier and carry findings that
+# the packages report as warnings (the same knob as in the manifests of the packages).
+[tier]
+tier          = "embedded"
+target        = "nrf54lm20-dk"
+sibling_check = "warn"
+
+[docs.pages]
+"README.md"        = "Programs built on the noble stack"
+"docs/examples.md" = "The Controller image and the Host on a PC: what each does and costs"
+
+# The Host on a PC.  Build it with `novo pkg build --bin main_pc --target=host -o main_pc`.
+[[bin]]
+name = "main_pc"
+path = "pc/main_pc.nv"
+
+# The noble Controller on the nRF54LM20 DK, answering HCI over the DK's first virtual COM port.  Build it with
+#   novo build --target=nrf54lm20-dk --hci-uart=physical -o hci_uart.elf controller/hci_uart_main.nv
+# A declared [[bin]] is a member of the package for a device build, so the build reads this manifest's dependencies; the
+# defaults of the schemas are the `device` profile of the Controller (one connection, no isochronous channels).
+[[bin]]
+name = "hci_uart"
+path = "controller/hci_uart_main.nv"
+
+# Registry ranges, as a published package writes them: `novo pkg publish` refuses a `path` dependency.  The packages are
+# developed side by side in the novo repository, where tests/orbit/test_noble_examples.sh builds this package from a copy whose
+# ranges are replaced by the sibling directories (docs/manifest.md, "A `path` dependency is for local development").
+[dependencies]
+noble            = "^0.1.0"
+noble-hci        = "^0.1.0"
+noble-controller = "^0.1.0"
+noble-radio      = "^0.1.0"

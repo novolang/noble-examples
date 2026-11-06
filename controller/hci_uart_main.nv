@@ -1,0 +1,1117 @@
+// controller/hci_uart_main.nv — the noble Controller's HCI over UART on the
+// nRF54LM20 DK: the image a Host on a PC drives through the DK's first
+// virtual COM port.
+//
+// The Controller of `noble-controller/src/ctl_hci.nv` answers the HCI Commands that
+// arrive on UARTE30 at 1 Mbaud with RTS/CTS flow control, the board's
+// VCOM0.  The main loop is one pass of four steps: answer the Command that
+// is complete, finish a Command that waits for the hardware, send one octet
+// of an event, and read one octet.  The octet read is taken only when the
+// Controller accepts it, so a Command that cannot be answered yet leaves the
+// stream in the UARTE and the flow control holds the Host.
+//
+// The public device address is the one in FICR.DEVICEADDR.  The Link Layer
+// of the image is the radio program of `noble-controller/src/ll_air.nv`,
+// on the RADIO of `radio_nrf54.nv`: the main loop polls it between the octets of
+// the HCI stream.
+// It holds one connection as Peripheral; the connection requests it takes are
+// the ones `DefaultLinkPolicy` accepts.
+//
+// Build and flash from the directory of the package (the recipe in README.md):
+//   novo build --target=nrf54lm20-dk --hci-uart=physical -o hci_uart.elf controller/hci_uart_main.nv
+//   probe-rs download --verify --chip nRF54LM20A hci_uart.elf
+// Log lines go to RTT; `probe-rs attach` shows them.
+
+use ctl_limits
+use ctl_hci
+use ctl_pool
+use ll_pdu
+use ll_policy
+use ll_cipher
+use ll_ecdh
+use ccm_nrf54
+use ecdh_nrf54
+use pdu_mem
+use ll_air
+use ll_radio
+use ll_big
+use ll_per
+use radio_nrf54
+use chip.rng_ctl
+use rng_nrf54
+use chip.status_leds
+use chip.led_snoop
+
+// The board's radio blocks are loaded by name from the entry file; `radio_nrf54`
+// uses their types.
+use nrf54_radio
+use nrf54_dppic
+
+// The UART's rate in bits per second.  The UARTE driver of the board starts
+// at 115200 for that value and at 1 Mbaud for any other.
+const BAUD = 1000000
+
+// The factory-programmed device address: FICR.DEVICEADDR[0] holds the four
+// least significant octets and FICR.DEVICEADDR[1] the two most significant.
+const FICR_DEVICEADDR = 0x00FFC3A4
+
+// Microseconds between two status lines.
+const STATUS_US = 5000000
+
+// The octets of the device address into the Controller.
+@no_alloc
+fn load_address(var c: Controller) [hw, mutate]
+    let low = hw.mem_read32(FICR_DEVICEADDR)
+    let high = hw.mem_read32(FICR_DEVICEADDR + 4)
+    for i in 0..4
+        ctl_hci.ctl_set_public(var c, i, (low >>> (8 * i)) & 0xFF)
+    for i in 0..2
+        ctl_hci.ctl_set_public(var c, 4 + i, (high >>> (8 * i)) & 0xFF)
+
+// Finish the Command that waits for the hardware, if one does.
+@no_alloc
+fn run_hardware<C: Cipher>(var c: Controller, var cc: C) [hw, mutate]
+    let kind = ctl_hci.ctl_async_kind(var c)
+    if kind == ctl_hci.PEND_ENCRYPT
+        ctl_hci.ctl_le_encrypt(var c, var cc)
+    if kind == ctl_hci.PEND_RAND
+        rng_ctl.fill(var c)
+
+// The work of the Encryption Start procedure that needs random octets or the
+// cipher.
+@no_alloc
+fn run_secure<C: Cipher>(var c: Controller, var cc: C, var rnd: Vec[u8; 12]) [hw, mutate]
+    if not ctl_hci.ctl_secure_wanted(var c)
+        return
+    var have = false
+    if ctl_hci.ctl_wants_random(var c)
+        have = rng_nrf54.take12(var rnd)
+    let _used = ctl_hci.ctl_secure_poll(var c, var cc, var rnd, have)
+
+// Run the P-256 work a command left: LE Read Local P-256 Public Key draws the private key
+// from the random number generator, and both commands wait for the public key engine.
+fn run_ecdh<E: Ecdh>(var c: Controller, var ecdh: E, var rnd: Vec[u8; 32]) [hw, mutate]
+    if not ctl_hci.ctl_ecdh_wanted(var c)
+        return
+    var have = false
+    if ctl_hci.ctl_ecdh_wants_random(var c)
+        have = rng_nrf54.take32(var rnd)
+    let _used = ctl_hci.ctl_ecdh_poll(var c, var ecdh, var rnd, have)
+
+// Run the work of privacy that needs the cipher: resolve an address the Link Layer queued,
+// make the Resolvable Private Addresses it asked for, and top up the random octets they are
+// made from.
+@no_alloc
+fn run_privacy<C: Cipher>(var c: Controller, var cc: C, var rnd: Vec[u8; 12]) [hw, mutate]
+    if ctl_hci.ctl_entropy_wanted(var c) and rng_nrf54.take12(var rnd)
+        ctl_hci.ctl_entropy_put(var c, var rnd)
+    if ctl_hci.ctl_privacy_wanted(var c)
+        let _used = ctl_hci.ctl_privacy_poll(var c, var cc)
+
+// Top up the random octets the key of an encrypted broadcast isochronous group is made from, the GSKD and the GIV of its BIGInfo.
+@no_alloc
+fn run_big(var c: Controller, var rnd: Vec[u8; 12]) [hw, mutate]
+    if ctl_hci.ctl_big_wants_random(var c) and rng_nrf54.take12(var rnd)
+        ctl_hci.ctl_big_random_put(var c, var rnd)
+
+// The octets one call moves each way at most, and how long the receiver waits inside a packet
+// for the next octet to land (a bound on the polls, about 25 microseconds at 1 Mbaud).  An ACL
+// packet of 255 octets takes 2.6 ms at 1 Mbaud; one octet per turn of the main loop, which
+// also runs the Link Layer, moved it at a tenth of the speed of the UART.  The bounds keep a turn
+// of the loop short enough (about 0.3 ms) for the Link Layer, which is polled in the same loop,
+// to start its next event on time.
+const MOVE_TX_MAX = 64
+const MOVE_RX_MAX = 128
+const MOVE_RX_SPINS = 160
+const MOVE_RX_POLLS = 2400
+
+// ── The Host's port ─────────────────────────────────────────────────
+
+// UARTE30 is the Host's port.  Its transmitter sends an octet by EasyDMA and, with the hardware flow control the
+// J-Link's virtual COM port is wired for, waits for CTS before the first bit: a Host that reads nothing (a PC that is busy,
+// a bridge that is blocked) leaves the octet in the transmitter for as long as it likes.  `hal.uart.write_byte` waits for the
+// octet to go, so one stopped Host would stop the main loop, and with it every connection event and stream event of the
+// Controller, until the Link Layer's supervision timeout ended them.  The port below hands the octet to
+// `hal.uart.try_write_byte`, which never waits for the line, and waits itself for no longer than the octet takes at 1 Mbaud:
+// an octet the transmitter has not taken then is held by the port (one at most) and the octets behind it wait in the
+// Controller's queue (`ctl_hci.HostTx`), and the events the queue has no room for are dropped and counted, as for a Host that is
+// slow.
+//
+// The reads of the transmitter's answer that make one wait for an octet at 1 Mbaud, with room for the clock of the chip: 10
+// microseconds an octet, and a call of the hook takes a few dozen cycles of 128 MHz.
+const TX_SPINS = 100
+
+// `pending` is the octet the transmitter has not taken yet, -1 for none; `held` counts the turns that found it still there
+// after the wait, and `sent` the octets the transmitter took.
+@value
+struct HostPort
+    pending: Int
+    held: Int
+    sent: Int
+
+fn host_port_new() -> HostPort
+    HostPort { pending: -1, held: 0, sent: 0 }
+
+impl ctl_hci.HostTx[hw, mutate] for HostPort
+    // The port takes another octet when the one it holds has been handed to the transmitter.
+    @no_alloc
+    fn ready(var self) -> Bool [hw, mutate]
+        if self.pending < 0
+            return true
+        if hal.uart.try_write_byte(self.pending) == 0
+            self.pending = -1
+            self.sent = self.sent + 1
+            return true
+        self.held = self.held + 1
+        false
+
+    @no_alloc
+    fn send(var self, b: Int) [hw, mutate]
+        for _ in 0..TX_SPINS
+            if hal.uart.try_write_byte(b) == 0
+                self.sent = self.sent + 1
+                return
+        self.pending = b
+
+// Send the octets of the event at the front of the queue, and read the octets of the
+// stream while the Controller takes them, for no longer than `room` microseconds: the
+// radio program has a booking to meet (`ctl_hci.ctl_ll_room`).  An octet out takes 10
+// microseconds and the UARTE holds one in; the octets that wait are the Host's, which
+// RTS/CTS holds back, and the events that wait are queued.
+@no_alloc
+fn move_octets(var c: Controller, var air: radio_nrf54.Nrf54Air, var port: HostPort,
+               room: Int) [hw, mutate]
+    let t0 = air.now_us()
+    let most = room / MOVE_OCTET_US
+    var out = MOVE_TX_MAX
+    if most < out
+        out = most
+    let _n = ctl_hci.ctl_tx_drain(var c, var port, out)
+    var got = 0
+    var idle = 0
+    for p in 0..MOVE_RX_POLLS
+        if got >= MOVE_RX_MAX or idle >= MOVE_RX_SPINS or not ctl_hci.ctl_accepts(var c)
+            break
+        if (p & 15) == 15 and air.now_us() - t0 > room
+            break
+        // The last octet of an ISO Data packet starts work of hundreds of microseconds (the SDU is cut into payloads): it is read
+        // when the time to the next booking holds that, or after the work has waited a number of turns.
+        if not ctl_hci.ctl_rx_fits(var c, room - (air.now_us() - t0))
+            break
+        let b = hal.uart.try_read_byte()
+        if b >= 0
+            led_snoop.snoop(b)
+            ctl_hci.ctl_rx(var c, b)
+            got = got + 1
+            idle = 0
+        else if ctl_hci.ctl_in_packet(var c)
+            idle = idle + 1
+        else
+            break
+
+// The microseconds an octet takes to leave at 1 Mbaud, with the start and stop bits.
+const MOVE_OCTET_US = 10
+
+// The decimal digit `d` as text.
+@no_alloc
+fn digit(d: Int) -> Str
+    match d
+        0 => "0"
+        1 => "1"
+        2 => "2"
+        3 => "3"
+        4 => "4"
+        5 => "5"
+        6 => "6"
+        7 => "7"
+        8 => "8"
+        _ => "9"
+
+// A non-negative number on the log, in decimal.  The log is RTT: the
+// UART carries nothing but HCI packets.
+@no_alloc
+fn log_int(v: Int) [hw]
+    var div = 1000000000
+    var started = false
+    for _ in 0..10
+        let d = v / div % 10
+        if d != 0 or started or div == 1
+            hal.uart.write(digit(d))
+            started = true
+        div = div / 10
+
+// The hex digit `d` as text.
+@no_alloc
+fn hex_digit(d: Int) -> Str
+    match d
+        0  => "0"
+        1  => "1"
+        2  => "2"
+        3  => "3"
+        4  => "4"
+        5  => "5"
+        6  => "6"
+        7  => "7"
+        8  => "8"
+        9  => "9"
+        10 => "a"
+        11 => "b"
+        12 => "c"
+        13 => "d"
+        14 => "e"
+        _  => "f"
+
+// One octet on the log, as two hex digits.  The log is RTT: `write_byte` would
+// put the octet on the HCI UART.
+@no_alloc
+fn log_hex(b: Int) [hw]
+    hal.uart.write(hex_digit((b >> 4) & 15))
+    hal.uart.write(hex_digit(b & 15))
+
+// A signed number on the log.
+fn log_signed(v: Int) [hw]
+    if v < 0
+        hal.uart.write("-")
+        log_int(0 - v)
+    else
+        log_int(v)
+
+// The fields of one link the status line prints, read once so that the line names a link
+// in two places and not at every field.
+@value
+struct LinkStat
+    phy: Int
+    enc_tx: Bool
+    enc_rx: Bool
+    tx_ctr: Int
+    rx_ctr: Int
+    live: Bool
+    interval: Int
+    ev_count: Int
+    data_in: Int
+    data_out: Int
+    held: Int
+    reason: Int
+    sn: Int
+    nesn: Int
+    room: Bool
+    txq_count: Int
+    cq_count: Int
+    cur_kind: Int
+    nxt_kind: Int
+    completed: Int
+    owed: Int
+
+fn link_stat(var l: Link) -> LinkStat
+    LinkStat { phy: l.phy,
+        enc_tx: l.enc_tx,
+        enc_rx: l.enc_rx,
+        tx_ctr: l.tx_ctr,
+        rx_ctr: l.rx_ctr,
+        live: l.live,
+        interval: l.interval,
+        ev_count: l.ev_count,
+        data_in: l.data_in,
+        data_out: l.data_out,
+        held: l.held,
+        reason: l.reason,
+        sn: l.sn,
+        nesn: l.nesn,
+        room: l.room,
+        txq_count: l.txq_count,
+        cq_count: l.cq_count,
+        cur_kind: l.cur_kind,
+        nxt_kind: l.nxt_kind,
+        completed: l.completed,
+        owed: l.owed }
+
+// The counters of the stream in slot `k`, one line: its state and event, the packets sent and heard, the first subevent run
+// (when, and its place in the ACL interval), and the offset and delay it was given.
+fn status_cis(var c: Controller, k: Int) [hw]
+    hal.uart.write("ll cis")
+    log_int(k)
+    hal.uart.write(" st=")
+    log_int(c.cis[k].state)
+    hal.uart.write(" ev=")
+    log_int(c.cis[k].ev)
+    hal.uart.write(" tx=")
+    log_int(c.cis[k].n_tx)
+    hal.uart.write(" rx=")
+    log_int(c.cis[k].n_rx)
+    hal.uart.write(" retx=")
+    log_int(c.cis[k].n_retx)
+    hal.uart.write(" ftx=")
+    log_int(c.cis[k].n_flush_tx)
+    hal.uart.write(" frx=")
+    log_int(c.cis[k].n_flush_rx)
+    hal.uart.write(" miss=")
+    log_int(c.cis[k].n_missed)
+    hal.uart.write(" sok=")
+    log_int(c.cis[k].n_sdu_ok)
+    hal.uart.write(" slost=")
+    log_int(c.cis[k].n_sdu_lost)
+    hal.uart.write(" hdrop=")
+    log_int(c.cis[k].n_host_drop)
+    hal.uart.write(" sdrop=")
+    log_int(c.cis[k].n_sdu_drop)
+    hal.uart.write(" owed=")
+    log_int(c.cis[k].owed)
+    hal.uart.write(" outn=")
+    log_int(c.cis[k].out_n)
+    hal.uart.write(" dp=")
+    log_int((if c.cis[k].dp_in then 2 else 0) + (if c.cis[k].dp_out then 1 else 0))
+    hal.uart.write(" good=")
+    log_int(c.cis[k].n_good)
+    hal.uart.write(" bad=")
+    log_int(c.cis[k].n_bad)
+    hal.uart.write(" nulltx=")
+    log_int(c.cis[k].n_null_tx)
+    hal.uart.write(" nullrx=")
+    log_int(c.cis[k].n_null_rx)
+    hal.uart.write(" crc=")
+    log_int(c.cis[k].n_crc)
+    hal.uart.write(" unack=")
+    log_int(c.cis[k].n_unack)
+    hal.uart.write(" evs=")
+    log_int(c.cis[k].n_events)
+    hal.uart.write(" synced=")
+    log_int((if c.cis[k].synced then 1 else 0))
+    hal.uart.write(" status=0x")
+    log_hex(c.cis[k].status)
+    hal.uart.write(" off=")
+    log_int(c.cis[k].cis_offset)
+    hal.uart.write(" sync=")
+    log_int(c.cis[k].cis_sync)
+    hal.uart.write(" subint=")
+    log_int(c.cis[k].sub_int)
+    hal.uart.write(" nse=")
+    log_int(c.cis[k].nse)
+    hal.uart.write(" bn=")
+    log_int(c.cis[k].bn_c)
+    hal.uart.write("/")
+    log_int(c.cis[k].bn_p)
+    hal.uart.write(" anchor=")
+    log_int(c.cis[k].anchor & 0xFFFFFF)
+    hal.uart.write(" first=")
+    log_int(c.cis[k].first_us & 0xFFFFFF)
+    hal.uart.write(" try=")
+    log_int(c.cis[k].t_try & 0xFFFFFF)
+    hal.uart.write(" try_phase=")
+    log_int(c.cis[k].ph_try)
+    hal.uart.write(" err_n=")
+    log_int(c.cis[k].err_n)
+    hal.uart.write(" err_first=")
+    log_signed(c.cis[k].err_first)
+    hal.uart.write(" err_min=")
+    log_signed(c.cis[k].err_min)
+    hal.uart.write(" err_max=")
+    log_signed(c.cis[k].err_max)
+    hal.uart.write(" req_win=")
+    log_int(c.cis[k].off_min)
+    hal.uart.write("-")
+    log_int(c.cis[k].off_max)
+    hal.uart.write("@")
+    log_int(c.cis[k].off_ev)
+    hal.uart.write(" cig_sync=")
+    log_int(c.cis[k].cig_sync)
+    hal.uart.write(" late_n=")
+    log_int(c.cis[k].late_n)
+    hal.uart.write(" late_mask=")
+    log_int(c.cis[k].late_mask)
+    hal.uart.write(" e_ind=")
+    log_int(c.cis[k].e_ind)
+    hal.uart.write(" t_ind=")
+    log_int(c.cis[k].t_ind & 0xFFFFFF)
+    hal.uart.write(" e_try=")
+    log_int(c.cis[k].e_try)
+    hal.uart.write(" a_try=")
+    log_int(c.cis[k].a_try & 0xFFFFFF)
+    hal.uart.write(" aa=")
+    log_int(c.cis[k].aa)
+    hal.uart.write(" ind_ev=")
+    log_int(c.cis[k].ind_ev)
+    if c.cis[k].acl >= 0
+        hal.uart.write(" evc=")
+        log_int(c.links[c.cis[k].acl].ev_count)
+        hal.uart.write(" due=")
+        log_int(c.links[c.cis[k].acl].due & 0xFFFFFF)
+    hal.uart.write("\n")
+
+// The radio program's counters for the subevents it ran, one line: how many, how many it heard nothing in, how late it started.
+fn status_prof(var rf: ll_air.Rf) [hw]
+    hal.uart.write("cis_fail prof subs=")
+    log_int(rf.cis_subs)
+    hal.uart.write(" missed=")
+    log_int(rf.cis_missed)
+    hal.uart.write(" aborts=")
+    log_int(rf.cis_aborts)
+    hal.uart.write(" good=")
+    log_int(rf.cis_good)
+    hal.uart.write(" bad=")
+    log_int(rf.cis_bad)
+    hal.uart.write(" chained=")
+    log_int(rf.cis_chained)
+    hal.uart.write(" late=")
+    log_int(rf.cis_late)
+    hal.uart.write(" late_us_max=")
+    log_int(rf.cis_late_max)
+    hal.uart.write(" ramp_timeouts=")
+    log_int(rf.ramp_timeouts)
+    hal.uart.write(" cen_events=")
+    log_int(rf.cen_events)
+    hal.uart.write(" cen_missed=")
+    log_int(rf.cen_missed)
+    hal.uart.write(" conn_late=")
+    log_int(rf.conn_late)
+    hal.uart.write(" acl_err_n=")
+    log_int(rf.acl_err_n)
+    hal.uart.write(" acl_err_min=")
+    log_signed(rf.acl_err_min)
+    hal.uart.write(" acl_err_max=")
+    log_signed(rf.acl_err_max)
+    hal.uart.write(" acl_err_last=")
+    log_signed(rf.acl_err_last)
+    hal.uart.write("\n")
+
+// The Link Layer's status line: what the Controller and the radio program
+// counted.
+fn status_ll(var c: Controller, var rf: ll_air.Rf, var air: radio_nrf54.Nrf54Air) [hw, mutate]
+    let st0 = link_stat(var c.links[0])
+    let st1 = link_stat(var c.links[1])
+    hal.uart.write("ll aux seen=")
+    log_int(c.init.aux_seen)
+    hal.uart.write(" followed=")
+    log_int(c.init.aux_followed)
+    hal.uart.write(" skipped=")
+    log_int(c.init.aux_skipped)
+    hal.uart.write(" missed=")
+    log_int(c.init.aux_missed)
+    hal.uart.write(" rsp_missed=")
+    log_int(c.init.aux_rsp_missed)
+    hal.uart.write(" connects=")
+    log_int(c.init.aux_connects)
+    hal.uart.write(" init_pkts=")
+    log_int(rf.init_pkts)
+    hal.uart.write(" init_sent=")
+    log_int(rf.init_sent)
+    hal.uart.write(" crc_bad=")
+    log_int(rf.scan_crc_bad)
+    hal.uart.write(" aborts=")
+    log_int(rf.spec_aborts)
+    hal.uart.write(" judge_us_max=")
+    log_int(rf.judge_max_us)
+    hal.uart.write(" ramp_timeouts=")
+    log_int(rf.ramp_timeouts)
+    hal.uart.write(" aux_rsp_min_us=")
+    log_signed(rf.aux_rsp_min_us)
+    hal.uart.write(" aux_rsp_max_us=")
+    log_signed(rf.aux_rsp_max_us)
+    hal.uart.write(" rsp_idle=")
+    log_int(rf.rsp_idle)
+    hal.uart.write("\n")
+    hal.uart.write("cis_req seen ")
+    log_int(c.cis_log.seen)
+    hal.uart.write(" rejected ")
+    log_int(c.cis_log.rejected)
+    hal.uart.write(" dropped ")
+    log_int(ctl_hci.cis_req_dropped(var c))
+    if c.cis_log.rejected > 0
+        hal.uart.write(" last code 0x")
+        log_hex(c.cis_log.code)
+        hal.uart.write(" branch ")
+        log_int(c.cis_log.why)
+        hal.uart.write(" phy ")
+        log_int(c.cis_log.phy)
+        hal.uart.write(" nse ")
+        log_int(c.cis_log.nse)
+        hal.uart.write(" bn ")
+        log_int(c.cis_log.bn_c)
+        hal.uart.write("/")
+        log_int(c.cis_log.bn_p)
+        hal.uart.write(" ft ")
+        log_int(c.cis_log.ft_c)
+        hal.uart.write("/")
+        log_int(c.cis_log.ft_p)
+        hal.uart.write(" pdu ")
+        log_int(c.cis_log.pdu_c)
+        hal.uart.write("/")
+        log_int(c.cis_log.pdu_p)
+        hal.uart.write(" iso_int ")
+        log_int(c.cis_log.iso_int)
+        hal.uart.write(" sub_int ")
+        log_int(c.cis_log.sub_int)
+        hal.uart.write(" sdu ")
+        log_int(c.cis_log.sdu_c)
+        hal.uart.write("/")
+        log_int(c.cis_log.sdu_p)
+    hal.uart.write("\n")
+    hal.uart.write("ll cen events=")
+    log_int(rf.cen_events)
+    hal.uart.write(" missed=")
+    log_int(rf.cen_missed)
+    hal.uart.write(" good=")
+    log_int(rf.cen_good)
+    hal.uart.write(" bad=")
+    log_int(rf.cen_bad)
+    hal.uart.write(" aborts=")
+    log_int(rf.cen_aborts)
+    hal.uart.write(" late=")
+    log_int(rf.conn_late)
+    hal.uart.write(" evc=")
+    log_int(c.links[0].ev_count)
+    let conn_us = ll_link.interval_us(var c.links[0])
+    if c.cis[0].state == ll_iso.S_UP and conn_us > 0
+        var ph = (c.cis[0].anchor - c.links[0].due) % conn_us
+        if ph < 0
+            ph = ph + conn_us
+        hal.uart.write(" cis_phase_us=")
+        log_int(ph)
+        hal.uart.write(" cis_off=")
+        log_int(c.cis[0].cis_offset)
+        hal.uart.write(" win=")
+        log_int(c.cis[0].off_min)
+        hal.uart.write("-")
+        log_int(c.cis[0].off_max)
+        hal.uart.write(" ind_ev=")
+        log_int(c.cis[0].ind_ev)
+        hal.uart.write(" evc0=")
+        log_int(c.cis[0].off_ev)
+    hal.uart.write("\n")
+    hal.uart.write("ll xscan seen=")
+    log_int(c.scan.x_seen)
+    hal.uart.write(" followed=")
+    log_int(c.scan.x_followed)
+    hal.uart.write(" skipped=")
+    log_int(c.scan.x_skipped)
+    hal.uart.write(" missed=")
+    log_int(c.scan.x_missed)
+    hal.uart.write(" truncated=")
+    log_int(c.scan.x_truncated)
+    hal.uart.write(" asks=")
+    log_int(rf.x_asks)
+    hal.uart.write(" chain_pdus=")
+    log_int(rf.x_pdus)
+    hal.uart.write(" chains=")
+    log_int(rf.x_chains)
+    hal.uart.write(" reports=")
+    log_int(c.scan.reports)
+    hal.uart.write(" dropped=")
+    log_int(c.dropped_events)
+    hal.uart.write(" pkts=")
+    log_int(rf.scan_pkts)
+    hal.uart.write(" slack_min_us=")
+    log_signed(rf.x_slack_min_us)
+    hal.uart.write(" tifs_n=")
+    log_int(rf.tifs_n)
+    hal.uart.write(" tifs_ns_min=")
+    log_signed(rf.tifs_min_ns)
+    hal.uart.write(" tifs_ns_max=")
+    log_signed(rf.tifs_max_ns)
+    hal.uart.write("\n")
+    hal.uart.write("ll xadv events=")
+    log_int(rf.x_adv_events)
+    hal.uart.write(" pdus=")
+    log_int(rf.x_adv_pdus)
+    hal.uart.write(" aux=")
+    log_int(rf.x_adv_aux)
+    hal.uart.write(" chain=")
+    log_int(rf.x_adv_chain)
+    hal.uart.write(" start_err_min_us=")
+    log_signed(rf.x_adv_err_min_us)
+    hal.uart.write(" start_err_max_us=")
+    log_signed(rf.x_adv_err_max_us)
+    hal.uart.write(" scan_req=")
+    log_int(c.adv.scan_reqs)
+    hal.uart.write(" scan_rsp=")
+    log_int(c.adv.scan_rsps)
+    hal.uart.write(" connect_ind=")
+    log_int(c.adv.connect_inds)
+    hal.uart.write(" listen_idle=")
+    log_int(rf.listen_idle)
+    hal.uart.write(" ramp_timeouts=")
+    log_int(rf.ramp_timeouts)
+    hal.uart.write("\n")
+    hal.uart.write("ll cisprof chained=")
+    log_int(rf.cis_chained)
+    hal.uart.write(" late=")
+    log_int(rf.cis_late)
+    hal.uart.write(" late_us_max=")
+    log_int(rf.cis_late_max)
+    hal.uart.write(" work_n=")
+    log_int(rf.cis_work_n)
+    hal.uart.write(" work_us_sum=")
+    log_int(rf.cis_work_sum)
+    hal.uart.write(" work_us_max=")
+    log_int(rf.cis_work_max)
+    hal.uart.write(" gap_us_min=")
+    log_int(rf.cis_gap_min)
+    hal.uart.write("\n")
+    hal.uart.write("ll big events=")
+    log_int(rf.big_events)
+    hal.uart.write(" subs=")
+    log_int(rf.big_subs)
+    hal.uart.write(" late=")
+    log_int(rf.big_late)
+    hal.uart.write(" skipped=")
+    log_int(rf.big_skipped)
+    hal.uart.write(" err_us_max=")
+    log_signed(rf.big_err_max_us)
+    hal.uart.write(" work_us_max=")
+    log_int(rf.big_work_max)
+    hal.uart.write(" good=")
+    log_int(rf.big_good)
+    hal.uart.write(" bad=")
+    log_int(rf.big_bad)
+    hal.uart.write(" missed=")
+    log_int(rf.big_missed)
+    hal.uart.write("\n")
+    if ctl_limits.big_on() and ctl_limits.per_on()
+        // The periodic trains next to a group: the events sent and the ones given up for the group's event.
+        hal.uart.write("ll per events=")
+        log_int(rf.x_per_events)
+        hal.uart.write(" given_up=")
+        log_int(c.per_late)
+        hal.uart.write("\n")
+    hal.uart.write("ll cis")
+    hal.uart.write(" subs=")
+    log_int(rf.cis_subs)
+    hal.uart.write(" missed=")
+    log_int(rf.cis_missed)
+    hal.uart.write(" aborts=")
+    log_int(rf.cis_aborts)
+    hal.uart.write(" good=")
+    log_int(rf.cis_good)
+    hal.uart.write(" bad=")
+    log_int(rf.cis_bad)
+    hal.uart.write(" state=")
+    log_int(c.cis[0].state)
+    hal.uart.write(" ev=")
+    log_int(c.cis[0].ev)
+    hal.uart.write(" synced=")
+    log_int((if c.cis[0].synced then 1 else 0))
+    hal.uart.write(" tx=")
+    log_int(c.cis[0].n_tx)
+    hal.uart.write(" rx=")
+    log_int(c.cis[0].n_rx)
+    hal.uart.write(" retx=")
+    log_int(c.cis[0].n_retx)
+    hal.uart.write(" flush_tx=")
+    log_int(c.cis[0].n_flush_tx)
+    hal.uart.write(" flush_rx=")
+    log_int(c.cis[0].n_flush_rx)
+    hal.uart.write(" crc=")
+    log_int(c.cis[0].n_crc)
+    hal.uart.write(" unack=")
+    log_int(c.cis[0].n_unack)
+    hal.uart.write(" sdu_ok=")
+    log_int(c.cis[0].n_sdu_ok)
+    hal.uart.write(" sdu_lost=")
+    log_int(c.cis[0].n_sdu_lost)
+    hal.uart.write(" host_drop=")
+    log_int(c.cis[0].n_host_drop)
+    hal.uart.write(" ev_missed=")
+    log_int(c.cis[0].n_missed)
+    hal.uart.write(" iso_dropped=")
+    log_int(c.iso_dropped)
+    hal.uart.write("\n")
+    for k in 1..ctl_limits.cis_slots()
+        status_cis(var c, k)
+    hal.uart.write("ll cis0 sdrop=")
+    log_int(c.cis[0].n_sdu_drop)
+    hal.uart.write(" reason0=")
+    log_int(c.cis[0].reason)
+    hal.uart.write(" link_reason=")
+    log_int(st0.reason)
+    hal.uart.write(" anchor0=")
+    log_int(c.cis[0].anchor & 0xFFFFFF)
+    hal.uart.write(" due=")
+    log_int(c.links[0].due & 0xFFFFFF)
+    hal.uart.write(" pool_free=")
+    log_int(ctl_hci.ctl_pool_free(var c))
+    hal.uart.write("\n")
+    hal.uart.write("ll phy phy=")
+    log_int(st0.phy)
+    hal.uart.write(" rx_len_max=")
+    log_int(rf.rx_len_max)
+    hal.uart.write(" rx_long=")
+    log_int(rf.rx_long)
+    hal.uart.write("\n")
+    hal.uart.write("ll crypto seals=")
+    log_int(rf.seals)
+    hal.uart.write(" seal_ticks_max=")
+    log_int(rf.seal_max)
+    hal.uart.write(" seal_ticks_sum=")
+    log_int(rf.seal_sum)
+    hal.uart.write(" seal_over_150us=")
+    log_int(rf.seal_slow)
+    hal.uart.write(" opens=")
+    log_int(rf.opens)
+    hal.uart.write(" open_ticks_sum=")
+    log_int(rf.open_sum)
+    hal.uart.write(" open_over_150us=")
+    log_int(rf.open_slow)
+    hal.uart.write(" chain_cut=")
+    log_int(rf.chain_cut)
+    hal.uart.write(" post_us_max=")
+    log_int(rf.post_max)
+    hal.uart.write(" post_us_sum=")
+    log_int(rf.post_sum)
+    hal.uart.write(" post_n=")
+    log_int(rf.post_n)
+    hal.uart.write(" open_ticks_max=")
+    log_int(rf.open_max)
+    hal.uart.write(" enc2=")
+    log_int((if st1.enc_tx then 2 else 0) + (if st1.enc_rx then 1 else 0))
+    hal.uart.write(" tx_ctr2=")
+    log_int(st1.tx_ctr)
+    hal.uart.write(" rx_ctr2=")
+    log_int(st1.rx_ctr)
+    hal.uart.write("\n")
+    hal.uart.write("ll ccm seals=")
+    log_int(ccm_nrf54.stat(0))
+    hal.uart.write(" seal_ticks=")
+    log_int(ccm_nrf54.stat(1))
+    hal.uart.write(" seal_wait=")
+    log_int(ccm_nrf54.stat(2))
+    hal.uart.write(" opens=")
+    log_int(ccm_nrf54.stat(3))
+    hal.uart.write(" open_ticks=")
+    log_int(ccm_nrf54.stat(4))
+    hal.uart.write(" open_wait=")
+    log_int(ccm_nrf54.stat(5))
+    hal.uart.write(" layout=")
+    log_int(pdu_mem.layout_state())
+    hal.uart.write("\n")
+    hal.uart.write("ll adv_pdus=")
+    log_int(rf.adv_pdus)
+    hal.uart.write(" heard=")
+    log_int(rf.adv_heard)
+    hal.uart.write(" scan_req=")
+    log_int(c.adv.scan_reqs)
+    hal.uart.write(" scan_rsp=")
+    log_int(rf.rsp_sent)
+    hal.uart.write(" connect_ind=")
+    log_int(c.adv.connect_inds)
+    hal.uart.write(" listen_idle=")
+    log_int(rf.listen_idle)
+    hal.uart.write(" scan_pkts=")
+    log_int(rf.scan_pkts)
+    hal.uart.write(" crc_bad=")
+    log_int(rf.scan_crc_bad)
+    hal.uart.write(" reports=")
+    log_int(c.scan.reports)
+    hal.uart.write(" dups=")
+    log_int(c.scan.duplicates)
+    hal.uart.write(" req_sent=")
+    log_int(rf.req_sent)
+    hal.uart.write(" rsp_heard=")
+    log_int(rf.rsp_heard)
+    hal.uart.write(" rsp_idle=")
+    log_int(rf.rsp_idle)
+    hal.uart.write(" aborts=")
+    log_int(rf.spec_aborts)
+    hal.uart.write(" late_aborts=")
+    log_int(rf.late_aborts)
+    hal.uart.write(" dropped=")
+    log_int(c.dropped_events)
+    hal.uart.write("\n")
+    hal.uart.write("ll filtered=")
+    log_int(c.adv.filtered)
+    hal.uart.write(" filt_type=")
+    log_int(c.adv.filt_type as Int)
+    hal.uart.write(" filt_addr=")
+    for i in 0..6
+        log_hex(c.adv.filt_addr[i] as Int)
+    hal.uart.write("\n")
+    hal.uart.write("ll cen")
+    hal.uart.write(" events=")
+    log_int(rf.cen_events)
+    hal.uart.write(" missed=")
+    log_int(rf.cen_missed)
+    hal.uart.write(" good=")
+    log_int(rf.cen_good)
+    hal.uart.write(" bad=")
+    log_int(rf.cen_bad)
+    hal.uart.write(" aborts=")
+    log_int(rf.cen_aborts)
+    hal.uart.write(" late=")
+    log_int(rf.conn_late)
+    hal.uart.write(" ev_count=")
+    log_int(st0.ev_count)
+    hal.uart.write(" live=")
+    log_int((if st0.live then 1 else 0))
+    hal.uart.write("\n")
+    hal.uart.write("ll tifs_n=")
+    log_int(rf.tifs_n)
+    hal.uart.write(" tifs_ns_min=")
+    log_signed(rf.tifs_min_ns)
+    hal.uart.write(" tifs_ns_max=")
+    log_signed(rf.tifs_max_ns)
+    hal.uart.write(" start_err_n=")
+    log_int(rf.err_n)
+    hal.uart.write(" err_us_min=")
+    log_signed(rf.err_min_us)
+    hal.uart.write(" err_us_max=")
+    log_signed(rf.err_max_us)
+    hal.uart.write(" ramp_timeouts=")
+    log_int(rf.ramp_timeouts)
+    hal.uart.write(" judge_us_max=")
+    log_int(rf.judge_max_us)
+    hal.uart.write("\n")
+    hal.uart.write("ll conn open=")
+    log_int(rf.conn_open)
+    hal.uart.write(" live=")
+    log_int((if st0.live then 1 else 0))
+    hal.uart.write(" events=")
+    log_int(rf.conn_events)
+    hal.uart.write(" missed=")
+    log_int(rf.conn_missed)
+    hal.uart.write(" good=")
+    log_int(rf.conn_good)
+    hal.uart.write(" bad=")
+    log_int(rf.conn_bad)
+    hal.uart.write(" aborts=")
+    log_int(rf.conn_aborts)
+    hal.uart.write(" late=")
+    log_int(rf.conn_late)
+    hal.uart.write(" interval=")
+    log_int(st0.interval)
+    hal.uart.write(" ev_count=")
+    log_int(st0.ev_count)
+    hal.uart.write(" anchor_n=")
+    log_int(rf.an_n)
+    hal.uart.write(" anchor_us_min=")
+    log_signed(rf.an_min_us)
+    hal.uart.write(" anchor_us_max=")
+    log_signed(rf.an_max_us)
+    hal.uart.write(" fast_ticks_max=")
+    log_int(rf.cy_conn)
+    hal.uart.write(" dropped_acl=")
+    log_int(c.dropped_acl)
+    hal.uart.write(" data_in=")
+    log_int(st0.data_in)
+    hal.uart.write(" data_out=")
+    log_int(st0.data_out)
+    hal.uart.write(" held=")
+    log_int(st0.held)
+    hal.uart.write(" enc=")
+    log_int((if st0.enc_tx then 2 else 0) + (if st0.enc_rx then 1 else 0))
+    hal.uart.write(" tx_ctr=")
+    log_int(st0.tx_ctr)
+    hal.uart.write(" rx_ctr=")
+    log_int(st0.rx_ctr)
+    hal.uart.write(" reason=")
+    log_int(st0.reason)
+    hal.uart.write(" sn=")
+    log_int(st0.sn)
+    hal.uart.write(" nesn=")
+    log_int(st0.nesn)
+    hal.uart.write(" room=")
+    log_int((if st0.room then 1 else 0))
+    hal.uart.write(" txq=")
+    log_int(st0.txq_count)
+    hal.uart.write(" cq=")
+    log_int(st0.cq_count)
+    hal.uart.write(" cur=")
+    log_int(st0.cur_kind)
+    hal.uart.write(" nxt=")
+    log_int(st0.nxt_kind)
+    hal.uart.write(" completed=")
+    log_int(st0.completed)
+    hal.uart.write(" owed=")
+    log_int(st0.owed)
+    hal.uart.write(" pool_free=")
+    log_int(ctl_pool.pool_free(var c.pool))
+    hal.uart.write("\n")
+    hal.uart.write("ll central init_pkts=")
+    log_int(rf.init_pkts)
+    hal.uart.write(" init_sent=")
+    log_int(rf.init_sent)
+    hal.uart.write(" live=")
+    log_int((if st1.live then 1 else 0))
+    hal.uart.write(" events=")
+    log_int(rf.cen_events)
+    hal.uart.write(" missed=")
+    log_int(rf.cen_missed)
+    hal.uart.write(" good=")
+    log_int(rf.cen_good)
+    hal.uart.write(" bad=")
+    log_int(rf.cen_bad)
+    hal.uart.write(" aborts=")
+    log_int(rf.cen_aborts)
+    hal.uart.write(" interval2=")
+    log_int(st1.interval)
+    hal.uart.write(" ev_count2=")
+    log_int(st1.ev_count)
+    hal.uart.write(" data_in2=")
+    log_int(st1.data_in)
+    hal.uart.write(" data_out2=")
+    log_int(st1.data_out)
+    hal.uart.write(" reason2=")
+    log_int(st1.reason)
+    hal.uart.write("\n")
+    hal.uart.write("ll cy_get_max=")
+    log_int(rf.cy_get)
+    hal.uart.write(" cy_scan_max=")
+    log_int(rf.cy_scan)
+    hal.uart.write(" cy_put_max=")
+    log_int(rf.cy_put)
+    hal.uart.write(" cy_adv_max=")
+    log_int(rf.cy_adv)
+    hal.uart.write("\n")
+    let g = hal.timer.ticks_us()
+    let t = air.stamp()
+    hal.uart.write("ll clock grtc_us=")
+    log_int(g)
+    hal.uart.write(" timer10_ticks=")
+    log_int(t)
+    hal.uart.write("\n")
+    hal.uart.write("ll ch37=")
+    log_int(rf.ch37)
+    hal.uart.write(" ch38=")
+    log_int(rf.ch38)
+    hal.uart.write(" ch39=")
+    log_int(rf.ch39)
+    hal.uart.write(" events=")
+    log_int(rf.ev_n)
+    hal.uart.write(" pdu_gap_us_min=")
+    log_int(rf.pdu_gap_min_us)
+    hal.uart.write(" pdu_gap_us_max=")
+    log_int(rf.pdu_gap_max_us)
+    hal.uart.write(" order_viol=")
+    log_int(rf.order_viol)
+    hal.uart.write(" event_gap_us_min=")
+    log_int(rf.ev_gap_min_us)
+    hal.uart.write(" event_gap_us_max=")
+    log_int(rf.ev_gap_max_us)
+    hal.uart.write("\n")
+
+// One status line: the counters the Controller keeps.
+@no_alloc
+fn status(var c: Controller) [hw]
+    hal.uart.write("hci_nrf54 answered=")
+    log_int(c.answered)
+    hal.uart.write(" unknown=")
+    log_int(c.unknown)
+    hal.uart.write(" resets=")
+    log_int(c.rx.commands)
+    hal.uart.write(" lost=")
+    log_int(c.rx.lost)
+    hal.uart.write(" discarded=")
+    log_int(c.rx.discarded)
+    hal.uart.write("\n")
+
+// One status line: the octets the Host's port took and the turns it held one (the Host's flow control stopped it).
+@no_alloc
+fn status_port(p: HostPort) [hw]
+    hal.uart.write("hci host sent=")
+    log_int(p.sent)
+    hal.uart.write(" held=")
+    log_int(p.held)
+    hal.uart.write("\n")
+
+// One status line: what the public key engine did, with the time of the last and of the
+// longest operation in microseconds.
+fn status_ecdh(var e: ecdh_nrf54.Nrf54Ecdh) [hw, mutate]
+    hal.uart.write("ecdh keys=")
+    log_int(e.keys)
+    hal.uart.write(" key_us=")
+    log_int(e.key_us)
+    hal.uart.write(" key_us_max=")
+    log_int(e.key_us_max)
+    hal.uart.write(" dhkeys=")
+    log_int(e.dhkeys)
+    hal.uart.write(" dh_us=")
+    log_int(e.dh_us)
+    hal.uart.write(" dh_us_max=")
+    log_int(e.dh_us_max)
+    hal.uart.write(" retries=")
+    log_int(ecdh_nrf54.retries())
+    hal.uart.write(" faults=")
+    log_int(e.faults)
+    hal.uart.write("\n")
+
+// The main loop with the cipher `cc`: the CCM00 and ECB00 peripherals of the chip, or
+// the software cipher of `ll_ccm.nv` on a chip without them.
+fn run<C: Cipher>(var cc: C) [hw, mutate]
+    bsp.board.init()
+    hal.uart.init(BAUD)
+    var c = ctl_hci.controller_new(ctl_hci.CAP_ECB | ctl_hci.CAP_RNG | ctl_hci.CAP_LL | ctl_hci.CAP_ECDH)
+    var rf = ll_air.rf_new()
+    var air = radio_nrf54.air_new()
+    var rx = ll_pdu.pdu_new()
+    var policy = ll_policy.default_link_policy()
+    var rnd: Vec[u8; 12] = Vec.new()
+    for _ in 0..12
+        let _z = rnd.push(0)
+    var key_rnd: Vec[u8; 32] = Vec.new()
+    for _ in 0..32
+        let _k = key_rnd.push(0)
+    var ecdh = ecdh_nrf54.nrf54_ecdh_new()
+    var port = host_port_new()
+    status_leds.init()
+    load_address(var c)
+    rng_nrf54.start()
+    radio_nrf54.air_init(var air)
+    ll_air.air_profile(var air, var c)
+    ctl_hci.ctl_seed(var c, hw.mem_read32(FICR_DEVICEADDR) ^ air.now_us())
+    hal.uart.write("hci_nrf54 up\n")
+    var next_status = hal.timer.ticks_us() + STATUS_US
+    var shown = 0
+    while true
+        ctl_hci.ctl_set_time(var c, air.now_us())
+        ctl_hci.ctl_set_room(var c, ctl_hci.ctl_ll_room(var c, air.now_us()))
+        let _ran = ctl_hci.ctl_step(var c)
+        run_hardware(var c, var cc)
+        run_secure(var c, var cc, var rnd)
+        run_ecdh(var c, var ecdh, var key_rnd)
+        run_privacy(var c, var cc, var rnd)
+        run_big(var c, var rnd)
+        move_octets(var c, var air, var port, ctl_hci.ctl_ll_room(var c, air.now_us()))
+        ll_air.ll_poll(var air, var c, var rf, var rx, var policy, var cc)
+        status_leds.update(var c, air.now_us())
+        // A stream that ends before it came up: its line goes out when it does, the status line comes too late for it.
+        for k in 0..ctl_limits.cis_slots()
+            if c.cis[k].state == ll_iso.S_CLOSING and c.cis[k].status != 0
+                if (shown & (1 << k)) == 0
+                    shown = shown | (1 << k)
+                    hal.uart.write("cis_fail k=")
+                    log_int(k)
+                    hal.uart.write(" status=0x")
+                    log_hex(c.cis[k].status)
+                    hal.uart.write(" good=")
+                    log_int(c.cis[k].n_good)
+                    hal.uart.write(" bad=")
+                    log_int(c.cis[k].n_bad)
+                    hal.uart.write(" nulltx=")
+                    log_int(c.cis[k].n_null_tx)
+                    hal.uart.write(" err_n=")
+                    log_int(c.cis[k].err_n)
+                    hal.uart.write(" err_first=")
+                    log_signed(c.cis[k].err_first)
+                    hal.uart.write(" err_max=")
+                    log_signed(c.cis[k].err_max)
+                    hal.uart.write(" acl_err_min=")
+                    log_signed(rf.acl_err_min)
+                    hal.uart.write(" acl_err_max=")
+                    log_signed(rf.acl_err_max)
+                    hal.uart.write(" acl_err_last=")
+                    log_signed(rf.acl_err_last)
+                    hal.uart.write(" ind_ev=")
+                    log_int(c.cis[k].ind_ev)
+                    hal.uart.write(" off=")
+                    log_int(c.cis[k].cis_offset)
+                    hal.uart.write("\n")
+            else
+                shown = shown & (0xFF ^ (1 << k))
+        if hal.timer.ticks_us() >= next_status
+            status(var c)
+            status_port(port)
+            status_ecdh(var ecdh)
+            status_ll(var c, var rf, var air)
+            ll_air.reset_window(var rf)
+            next_status = hal.timer.ticks_us() + STATUS_US
+
+fn main() [hw, mutate]
+    var cc = ccm_nrf54.nrf54_cipher_new()
+    run(var cc)
